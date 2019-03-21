@@ -14,7 +14,7 @@
 # limitations under the License.
 #
 import flask
-from flask import Flask, request
+from flask import Flask, request, jsonify, redirect
 from flask_sockets import Sockets
 import gevent
 from gevent import queue
@@ -23,106 +23,166 @@ import json
 import os
 
 app = Flask(__name__)
+global gevents
+
 sockets = Sockets(app)
 app.debug = True
 
+clients = list()
+
 class World:
-    def __init__(self):
-        self.clear()
-        # we've got listeners now!
-        self.listeners = list()
-        
-    def add_set_listener(self, listener):
-        self.listeners.append( listener )
+	def __init__(self):
+		self.clear()
+		# we've got listeners now!
+		self.listeners = list()
 
-    def update(self, entity, key, value):
-        entry = self.space.get(entity,dict())
-        entry[key] = value
-        self.space[entity] = entry
-        self.update_listeners( entity )
+	def add_set_listener(self, listener):
+		self.listeners.append( listener )
 
-    def set(self, entity, data):
-        self.space[entity] = data
-        self.update_listeners( entity )
+	def update(self, entity, key, value):
+		entry = self.space.get(entity,dict())
+		entry[key] = value
+		self.space[entity] = entry
+		self.update_listeners( entity )
 
-    def update_listeners(self, entity):
-        '''update the set listeners'''
-        for listener in self.listeners:
-            listener(entity, self.get(entity))
+	def set(self, entity, data):
+		self.space[entity] = data
+		self.update_listeners( entity )
 
-    def clear(self):
-        self.space = dict()
+	def update_listeners(self, entity):
+		'''update the set listeners'''
+		for listener in self.listeners:
+			listener(entity, self.get(entity))
 
-    def get(self, entity):
-        return self.space.get(entity,dict())
-    
-    def world(self):
-        return self.space
+	def clear(self):
+		self.space = dict()
 
-myWorld = World()        
+	def get(self, entity):
+		return self.space.get(entity,dict())
+
+	def world(self):
+		return self.space
+
+myWorld = World()
 
 def set_listener( entity, data ):
-    ''' do something with the update ! '''
+	''' do something with the update ! '''
 
 myWorld.add_set_listener( set_listener )
-        
+
+def send_all(msg):
+	for client in clients:
+		client.put(msg)
+
+def send_all_json(obj):
+	send_all(json.dumps(obj))
+
+class Client:
+	def __init__(self):
+		self.queue = queue.Queue()
+	
+	def put(self, v):
+		self.queue.put_nowait(v)
+	
+	def get(self):
+		return self.queue.get()
+
 @app.route('/')
 def hello():
-    '''Return something coherent here.. perhaps redirect to /static/index.html '''
-    return None
+	'''Return something coherent here.. perhaps redirect to /static/index.html '''
+	return flask.redirect('/static/index.html')
 
 def read_ws(ws,client):
-    '''A greenlet function that reads from the websocket and updates the world'''
-    # XXX: TODO IMPLEMENT ME
-    return None
+	'''A greenlet function that reads from the websocket and updates the world'''
+
+	try:
+		while(True): 
+			msg = ws.receive()
+			if (msg is not None):
+				packet = json.loads(msg)
+				send_all_json(packet)
+				keys = packet.keys()
+				for key in keys:
+					myWorld.set(key, packet[key])
+			else:
+				break
+	except:
+		'''Done'''
+	
+	return None
 
 @sockets.route('/subscribe')
 def subscribe_socket(ws):
-    '''Fufill the websocket URL of /subscribe, every update notify the
-       websocket and read updates from the websocket '''
-    # XXX: TODO IMPLEMENT ME
-    return None
+	'''Fufill the websocket URL of /subscribe, every update notify the
+	   websocket and read updates from the websocket '''
+	# XXX: TODO IMPLEMENT ME
+	client = Client()
+	clients.append(client)
+	g = gevent.spawn( read_ws, ws, client)
+	ws.send(json.dumps(myWorld.world()))
+	print ("Subscribing...")
+	
+	try:
+		while (True):
+			msg = client.get()
+			if (msg is not None):
+				print("Got a message!")
+				ws.send(msg)
+			else:
+				break
+	except Exception as e:
+		print ("WS Error %s" % e)
+		
+	finally:	
+		ws.close()
+		clients.remove(client)
+		gevent.kill(g)
+	
+	return None
 
 
 # I give this to you, this is how you get the raw body/data portion of a post in flask
 # this should come with flask but whatever, it's not my project.
 def flask_post_json():
-    '''Ah the joys of frameworks! They do so much work for you
-       that they get in the way of sane operation!'''
-    if (request.json != None):
-        return request.json
-    elif (request.data != None and request.data.decode("utf8") != u''):
-        return json.loads(request.data.decode("utf8"))
-    else:
-        return json.loads(request.form.keys()[0])
+	'''Ah the joys of frameworks! They do so much work for you
+	   that they get in the way of sane operation!'''
+	if (request.json != None):
+		return request.json
+	elif (request.data != None and request.data.decode("utf8") != u''):
+		return json.loads(request.data.decode("utf8"))
+	else:
+		return json.loads(request.form.keys()[0])
 
 @app.route("/entity/<entity>", methods=['POST','PUT'])
 def update(entity):
-    '''update the entities via this interface'''
-    return None
+	'''update the entities via this interface'''
+	for key in flask_post_json():
+		myWorld.update(entity, key, flask_post_json[key])
+	return jsonify(myWorld.get(entity))
 
-@app.route("/world", methods=['POST','GET'])    
+@app.route("/world", methods=['POST','GET'])
 def world():
-    '''you should probably return the world here'''
-    return None
+	'''you should probably return the world here'''
+	return jsonify(myWorld.world()), 200
 
-@app.route("/entity/<entity>")    
+@app.route("/entity/<entity>")
 def get_entity(entity):
-    '''This is the GET version of the entity interface, return a representation of the entity'''
-    return None
+	'''This is the GET version of the entity interface, return a representation of the entity'''
+	return (jsonify(myWorld.get(entity)), 200)
 
 
 @app.route("/clear", methods=['POST','GET'])
 def clear():
-    '''Clear the world out!'''
-    return None
+	'''Clear the world out!'''
+	myWorld.clear()
+	return jsonify(myWorld.world()), 200
 
 
 
 if __name__ == "__main__":
-    ''' This doesn't work well anymore:
-        pip install gunicorn
-        and run
-        gunicorn -k flask_sockets.worker sockets:app
-    '''
-    app.run()
+	''' This doesn't work well anymore:
+	pip install gunicorn
+	and run
+	gunicorn -k flask_sockets.worker sockets:app
+	'''
+	app.run()
